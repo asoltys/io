@@ -61,14 +61,21 @@ static struct io_plan *write_out(struct io_conn *c, struct buffer *b) {
                             &b->wlen, write_out, b);
 }
 
+/* Reads output from the child process and sends it to the client */
+static struct io_plan *read_from_child(struct io_conn *conn, struct buffer *child_buf) {
+    return io_read_partial(conn, child_buf->buf + child_buf->end,
+                           sizeof(child_buf->buf) - child_buf->end,
+                           &child_buf->rlen, write_out, child_buf);
+}
+
 /* Processes the query received from the client */
 static void process_query(const char *query, int tochild[2], int fromchild[2]) {
     if (!fork()) {
         // Child process
-        close(tochild[1]);  // Close unused write end
-        close(fromchild[0]); // Close unused read end
+        close(tochild[1]);      // Close unused write end
+        close(fromchild[0]);    // Close unused read end
 
-        dup2(tochild[0], STDIN_FILENO);  // Child reads from the pipe
+        dup2(tochild[0], STDIN_FILENO);   // Child reads from the pipe
         dup2(fromchild[1], STDOUT_FILENO); // Child writes to the pipe
 
         // Execute the strfry command
@@ -81,21 +88,23 @@ static void process_query(const char *query, int tochild[2], int fromchild[2]) {
     close(fromchild[1]);
 }
 
-/* Handles a new client connection */
 static struct io_plan *new_connection(struct io_conn *conn, void *arg) {
-    int *fromchild = (int *)arg;
-    struct buffer *to = tal(conn, struct buffer);
-    struct buffer *from = tal(conn, struct buffer);
+    int *pipes = (int *)arg; // pipes[0]: tochild, pipes[1]: fromchild
+    struct buffer *child_buf = tal(conn, struct buffer);
+    struct buffer *client_buf = tal(conn, struct buffer);
 
-    memset(to, 0, sizeof(*to));
-    memset(from, 0, sizeof(*from));
+    memset(child_buf, 0, sizeof(*child_buf));
+    memset(client_buf, 0, sizeof(*client_buf));
 
-    // Client input to strfry
-    io_new_conn(NULL, *fromchild, read_in, from);
-    io_new_conn(NULL, STDOUT_FILENO, write_out, from);
+    // Read from client and send to child
+    io_new_conn(NULL, pipes[0], read_in, client_buf);
 
-    return io_read_partial(conn, to->buf, sizeof(to->buf),
-                           &to->rlen, read_in, to);
+    // Read from child and send to client
+    return io_duplex(conn,
+                     io_read_partial(conn, client_buf->buf, sizeof(client_buf->buf),
+                                     &client_buf->rlen, read_in, client_buf),
+                     io_write_partial(conn, child_buf->buf, sizeof(child_buf->buf),
+                                      &child_buf->wlen, write_out, child_buf));
 }
 
 int main(void) {
@@ -122,11 +131,9 @@ int main(void) {
     if (pipe(tochild) < 0 || pipe(fromchild) < 0)
         err(1, "pipe");
 
-    // Spawn a child to handle strfry queries
-    process_query("strfry scan '{\"kinds\":[1],\"limit\":2}'", tochild, fromchild);
-
     // Accept new connections
-    io_new_listener(NULL, fd, new_connection, &fromchild[0]);
+    int pipes[] = {tochild[1], fromchild[0]};
+    io_new_listener(NULL, fd, new_connection, pipes);
     io_loop(NULL, NULL);
 
     close(fd);
