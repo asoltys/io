@@ -1,143 +1,177 @@
 #include <ccan/io/io.h>
-#include <ccan/err/err.h>
+#include <ccan/tal/tal.h>
+#include <ccan/tal/str/str.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <signal.h>
 #include <unistd.h>
-#include <string.h>
-#include <stdlib.h>
-#include <stdio.h>
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define SOCKET_PATH "/tmp/strfry.sock"
 #define BUFFER_SIZE 4096
 
-struct buffer {
-    bool finished;
-    size_t start, end, rlen, wlen;
-    char buf[BUFFER_SIZE];
+/* Represents a client connection */
+struct client {
+    int pipe_fd;               // File descriptor for subprocess
+    char *buffer;              // Buffer for reading/writing
+    size_t used;               // Number of bytes used in the buffer
+    size_t write_offset;       // Offset for writing data to the client
+    bool finished;              // Whether the command execution is finished
+    enum { READING, PROCESSING, WRITING } state; // Connection state
 };
 
-/* Called when finished reading */
-static void finish(struct io_conn *c, struct buffer *b) {
-    b->finished = true;
-    io_wake(b); // Wake up waiting writers
+const char *state_to_string(int state) {
+    switch (state) {
+    case READING:
+        return "READING";
+    case PROCESSING:
+        return "PROCESSING";
+    case WRITING:
+        return "WRITING";
+    default:
+        return "UNKNOWN";
+    }
 }
 
-/* Reads input from the client */
-static struct io_plan *read_in(struct io_conn *c, struct buffer *b) {
-    b->end += b->rlen;
+/* Function prototypes */
+static struct io_plan *read_query(struct io_conn *conn, struct client *c);
+static struct io_plan *execute_command(struct io_conn *conn, struct client *c);
+static struct io_plan *read_results(struct io_conn *conn, struct client *c);
+static struct io_plan *write_results(struct io_conn *conn, struct client *c);
+static void close_client(struct io_conn *conn, struct client *c);
 
-    if (b->rlen != 0)
-        io_wake(b);
-
-    if (b->start == b->end)
-        b->start = b->end = 0;
-
-    if (b->end == sizeof(b->buf))
-        return io_wait(c, b, read_in, b);
-
-    return io_read_partial(c, b->buf + b->end, sizeof(b->buf) - b->end,
-                           &b->rlen, read_in, b);
+/* Executes the `strfry scan` command in a subprocess */
+static int run_command(const char *command) {
+    int pipe_fds[2];
+    if (pipe(pipe_fds) < 0) {
+        perror("pipe");
+        return -1;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        return -1;
+    } else if (pid == 0) {
+        close(pipe_fds[0]);  // Close read end in child
+        dup2(pipe_fds[1], STDOUT_FILENO);
+        execl("/bin/sh", "sh", "-c", command, (char *)NULL);
+        perror("execl");
+        exit(1);
+    }
+    close(pipe_fds[1]);  // Close write end in parent
+    return pipe_fds[0];
 }
 
-/* Writes output to the client */
-static struct io_plan *write_out(struct io_conn *c, struct buffer *b) {
-    b->start += b->wlen;
-    b->wlen = 0;
+/* Reads the query from the client */
+static struct io_plan *read_query(struct io_conn *conn, struct client *c) {
+    fprintf(stderr, "[DEBUG] State: %s\n", state_to_string(c->state));
+    if (c->state != READING) {
+        fprintf(stderr, "[ERROR] Invalid state transition: %s\n", state_to_string(c->state));
+        return io_close(conn);  // Close the connection if state is invalid
+    }
+    c->state = PROCESSING;  // Update state to processing
+    return io_read_partial(conn, c->buffer + c->used, BUFFER_SIZE - c->used,
+                           &c->used, execute_command, c);
+}
 
-    if (b->wlen != 0)
-        io_wake(b);
+/* Executes the command and prepares to read results */
+static struct io_plan *execute_command(struct io_conn *conn, struct client *c) {
+    fprintf(stderr, "[DEBUG] Executing command: %s\n", c->buffer);
+    c->pipe_fd = run_command(c->buffer);
+    if (c->pipe_fd < 0) {
+        fprintf(stderr, "[ERROR] Failed to execute command\n");
+        return io_close(conn);
+    }
+    c->state = WRITING;  // Update state to writing results
+    io_new_conn(NULL, c->pipe_fd, read_results, c);  // Handle subprocess output
+    return io_wait(conn, c, read_query, c);          // Wait for more input
+}
 
-    if (b->end == b->start) {
-        if (b->finished)
-            return io_close(c);
-        return io_wait(c, b, write_out, b);
+/* Reads results from the subprocess */
+static struct io_plan *read_results(struct io_conn *conn, struct client *c) {
+    ssize_t n = read(c->pipe_fd, c->buffer, BUFFER_SIZE);
+    if (n < 0) {
+        perror("[ERROR] Failed to read from subprocess");
+        return io_close(conn);
+    } else if (n == 0) {
+        c->finished = true;  // Subprocess is done
+        close(c->pipe_fd);
+        return write_results(conn, c);
     }
 
-    return io_write_partial(c, b->buf + b->start, b->end - b->start,
-                            &b->wlen, write_out, b);
+    c->used = n;
+    c->write_offset = 0;
+    return write_results(conn, c);
 }
 
-/* Reads output from the child process and sends it to the client */
-static struct io_plan *read_from_child(struct io_conn *conn, struct buffer *child_buf) {
-    return io_read_partial(conn, child_buf->buf + child_buf->end,
-                           sizeof(child_buf->buf) - child_buf->end,
-                           &child_buf->rlen, write_out, child_buf);
-}
-
-/* Processes the query received from the client */
-static void process_query(const char *query, int tochild[2], int fromchild[2]) {
-    if (!fork()) {
-        // Child process
-        close(tochild[1]);      // Close unused write end
-        close(fromchild[0]);    // Close unused read end
-
-        dup2(tochild[0], STDIN_FILENO);   // Child reads from the pipe
-        dup2(fromchild[1], STDOUT_FILENO); // Child writes to the pipe
-
-        // Execute the strfry command
-        execl("/bin/sh", "sh", "-c", query, (char *)NULL);
-        err(1, "execl");
+/* Writes results back to the client */
+static struct io_plan *write_results(struct io_conn *conn, struct client *c) {
+    if (c->write_offset < c->used) {
+        return io_write_partial(conn, c->buffer + c->write_offset,
+                                c->used - c->write_offset, &c->write_offset,
+                                write_results, c);
     }
 
-    // Parent closes unused ends
-    close(tochild[0]);
-    close(fromchild[1]);
+    // If the subprocess is finished, close the connection
+    if (c->finished) {
+        printf("[INFO] Finished sending results to client\n");
+        return io_close(conn);
+    }
+
+    // Wait for more results from the subprocess
+    return io_wait(conn, c, read_results, c);
 }
 
-static struct io_plan *new_connection(struct io_conn *conn, void *arg) {
-    int *pipes = (int *)arg; // pipes[0]: tochild, pipes[1]: fromchild
-    struct buffer *child_buf = tal(conn, struct buffer);
-    struct buffer *client_buf = tal(conn, struct buffer);
+/* Cleans up a client connection */
+static void close_client(struct io_conn *conn, struct client *c) {
+    if (c->pipe_fd >= 0)
+        close(c->pipe_fd);
+    tal_free(c);
+}
 
-    memset(child_buf, 0, sizeof(*child_buf));
-    memset(client_buf, 0, sizeof(*client_buf));
-
-    // Read from client and send to child
-    io_new_conn(NULL, pipes[0], read_in, client_buf);
-
-    // Read from child and send to client
+/* Handles a new client connection */
+static struct io_plan *new_client(struct io_conn *conn, void *arg) {
+    struct client *c = tal(conn, struct client);
+    c->buffer = tal_arr(c, char, BUFFER_SIZE);
+    c->used = 0;
+    c->pipe_fd = -1;
+    c->state = READING;  // Initial state for the connection
     return io_duplex(conn,
-                     io_read_partial(conn, client_buf->buf, sizeof(client_buf->buf),
-                                     &client_buf->rlen, read_in, client_buf),
-                     io_write_partial(conn, child_buf->buf, sizeof(child_buf->buf),
-                                      &child_buf->wlen, write_out, child_buf));
+                     read_query(conn, c),  // Start reading from the client
+                     io_never(conn, c));   // No writes initially
 }
 
+/* Main server setup */
 int main(void) {
-    int fd, tochild[2], fromchild[2];
-    struct sockaddr_un addr;
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) {
+        perror("socket");
+        return 1;
+    }
 
-    // Create socket
-    fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (fd < 0)
-        err(1, "socket");
-
-    addr.sun_family = AF_UNIX;
+    struct sockaddr_un addr = {
+        .sun_family = AF_UNIX,
+    };
     strncpy(addr.sun_path, SOCKET_PATH, sizeof(addr.sun_path) - 1);
     unlink(SOCKET_PATH);
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-        err(1, "bind");
-    if (listen(fd, 5) < 0)
-        err(1, "listen");
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+
+    if (listen(fd, 5) < 0) {
+        perror("listen");
+        return 1;
+    }
 
     printf("[INFO] Listening on %s\n", SOCKET_PATH);
 
-    // Create pipes for communication with the strfry process
-    if (pipe(tochild) < 0 || pipe(fromchild) < 0)
-        err(1, "pipe");
-
-    // Accept new connections
-    int pipes[] = {tochild[1], fromchild[0]};
-    io_new_listener(NULL, fd, new_connection, pipes);
+    io_new_listener(NULL, fd, new_client, NULL);
     io_loop(NULL, NULL);
 
     close(fd);
-    unlink(SOCKET_PATH);
-
     return 0;
 }
