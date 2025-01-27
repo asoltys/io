@@ -1,0 +1,2 @@
+ccan/time-Makefile: ccan/time/time.c ccan/time/time.h ccan/time/_info
+ccan/time.o: ccan/time/time.o

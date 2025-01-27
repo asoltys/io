@@ -1,0 +1,2 @@
+ccan/noerr-Makefile: ccan/noerr/noerr.c ccan/noerr/noerr.h ccan/noerr/_info
+ccan/noerr.o: ccan/noerr/noerr.o

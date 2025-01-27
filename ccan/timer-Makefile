@@ -1,0 +1,2 @@
+ccan/timer-Makefile: ccan/timer/timer.c ccan/timer/timer.h ccan/timer/_info
+ccan/timer.o: ccan/timer/timer.o

@@ -1,0 +1,2 @@
+ccan/tal-Makefile: ccan/tal/tal.c ccan/tal/tal.h ccan/tal/_info
+ccan/tal.o: ccan/tal/tal.o

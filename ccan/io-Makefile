@@ -1,0 +1,2 @@
+ccan/io-Makefile: ccan/io/backend.h ccan/io/io.c ccan/io/io.h ccan/io/io_plan.h ccan/io/poll.c ccan/io/_info
+ccan/io.o: ccan/io/io.o ccan/io/poll.o

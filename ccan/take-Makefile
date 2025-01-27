@@ -1,0 +1,2 @@
+ccan/take-Makefile: ccan/take/take.c ccan/take/take.h ccan/take/_info
+ccan/take.o: ccan/take/take.o
